@@ -1,0 +1,31 @@
+# Python bytecode and cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+
+# Platform/environment
+.env
+.venv
+env/
+venv/
+
+# Database files (local dev/test)
+*.db
+*.sqlite3
+event_networking.db
+
+# Pytest/testing
+.pytest_cache/
+*.log
+
+# VSCode, PyCharm, IDE files
+.vscode/
+.idea/
+*.sublime-*
+*.swp
+*.swo
+*~
+
+# Python version managers
+.python-version
