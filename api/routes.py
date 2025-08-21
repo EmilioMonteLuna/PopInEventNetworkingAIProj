@@ -3,12 +3,15 @@ API Routes for Event Networking AI System
 FastAPI endpoints for user management, events, recommendations, and clustering
 """
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File
 from sqlalchemy.orm import Session
 from typing import List, Optional
 from datetime import datetime
 import logging
 import networkx as nx
+import pandas as pd
+import io
+import csv
 
 from database.connection import get_db
 from models.schemas import (
@@ -21,6 +24,7 @@ from models.database import User, Event, EventAttendee, UserInterest, UserGoal
 from services.recommendation_engine import RecommendationEngine
 from services.clustering_service import ClusteringService
 from services.data_service import DataService
+from services.linkedin_service import LinkedInService
 from fastapi.responses import JSONResponse
 import plotly
 
@@ -31,6 +35,7 @@ router = APIRouter()
 recommendation_engine = RecommendationEngine()
 clustering_service = ClusteringService()
 data_service = DataService()
+linkedin_service = LinkedInService()
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -272,6 +277,483 @@ async def register_user_for_event(event_id: int, user_id: int, db: Session = Dep
     except Exception as e:
         logger.error(f"Error registering user: {str(e)}")
         raise HTTPException(status_code=500, detail="Internal server error")
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# LINKEDIN INTEGRATION ENDPOINTS
+# ════════════════════════════════════════════════════════════════════════════════
+
+@router.get("/linkedin/auth")
+async def linkedin_auth():
+    """
+    Initiate LinkedIn OAuth flow
+    Returns authorization URL for user to grant permissions
+    """
+    try:
+        if not linkedin_service.client_id:
+            raise HTTPException(
+                status_code=501, 
+                detail="LinkedIn integration not configured. Please set LINKEDIN_CLIENT_ID and LINKEDIN_CLIENT_SECRET"
+            )
+        
+        # Generate unique state for CSRF protection
+        import secrets
+        state = secrets.token_urlsafe(32)
+        
+        auth_url = linkedin_service.get_authorization_url(state=state)
+        
+        return {
+            "authorization_url": auth_url,
+            "state": state,
+            "instructions": "Visit the authorization URL to grant LinkedIn permissions, then return with the authorization code"
+        }
+        
+    except Exception as e:
+        logger.error(f"Error initiating LinkedIn auth: {str(e)}")
+        raise HTTPException(status_code=500, detail="LinkedIn authentication initiation failed")
+
+
+@router.post("/linkedin/callback")
+async def linkedin_callback(
+    authorization_code: str,
+    state: Optional[str] = None,
+    user_id: Optional[int] = None,
+    db: Session = Depends(get_db)
+):
+    """
+    Handle LinkedIn OAuth callback and create/update user profile
+    
+    Args:
+        authorization_code: Authorization code from LinkedIn
+        state: State parameter for CSRF validation
+        user_id: Optional existing user ID to update with LinkedIn data
+    """
+    try:
+        # Exchange code for access token
+        token_data = linkedin_service.exchange_code_for_token(authorization_code)
+        access_token = token_data.get('access_token')
+        
+        if not access_token:
+            raise HTTPException(status_code=400, detail="Failed to obtain access token from LinkedIn")
+        
+        # Fetch LinkedIn profile data
+        profile_data = linkedin_service.fetch_profile(access_token)
+        
+        # Create or update user
+        user = linkedin_service.create_or_update_user_from_linkedin(
+            db=db, 
+            profile_data=profile_data, 
+            user_id=user_id
+        )
+        
+        # Get full user profile with interests and goals
+        interests = [i.interest for i in user.interests]
+        goals = [g.goal for g in user.goals]
+        
+        return {
+            "message": "LinkedIn profile successfully imported",
+            "user": {
+                "id": user.id,
+                "name": user.name,
+                "email": user.email,
+                "linkedin_url": user.linkedin_url,
+                "bio": user.bio,
+                "interests": interests,
+                "goals": goals
+            },
+            "linkedin_data": {
+                "headline": profile_data.get('headline'),
+                "profile_picture_url": profile_data.get('profile_picture_url'),
+                "fetched_at": profile_data.get('fetched_at')
+            },
+            "token_expires_at": token_data.get('expires_at').isoformat() if token_data.get('expires_at') else None
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in LinkedIn callback: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"LinkedIn integration failed: {str(e)}")
+
+
+@router.get("/linkedin/profile/{access_token}")
+async def get_linkedin_profile(access_token: str):
+    """
+    Fetch LinkedIn profile data using access token (for testing)
+    Note: In production, store tokens securely and use proper authentication
+    """
+    try:
+        if not linkedin_service.validate_token(access_token):
+            raise HTTPException(status_code=401, detail="Invalid or expired LinkedIn access token")
+        
+        profile_data = linkedin_service.fetch_profile(access_token)
+        return {
+            "profile_data": profile_data,
+            "message": "LinkedIn profile fetched successfully"
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching LinkedIn profile: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to fetch LinkedIn profile")
+
+
+@router.post("/users/{user_id}/linkedin-import")
+async def import_linkedin_data(
+    user_id: int,
+    authorization_code: str,
+    db: Session = Depends(get_db)
+):
+    """
+    Import LinkedIn data for an existing user
+    
+    Args:
+        user_id: Existing user ID
+        authorization_code: LinkedIn authorization code
+    """
+    try:
+        # Verify user exists
+        user = db.query(User).filter(User.id == user_id).first()
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        
+        # Exchange code for token and fetch profile
+        token_data = linkedin_service.exchange_code_for_token(authorization_code)
+        access_token = token_data.get('access_token')
+        
+        if not access_token:
+            raise HTTPException(status_code=400, detail="Failed to obtain LinkedIn access token")
+        
+        profile_data = linkedin_service.fetch_profile(access_token)
+        
+        # Update existing user with LinkedIn data
+        updated_user = linkedin_service.create_or_update_user_from_linkedin(
+            db=db,
+            profile_data=profile_data,
+            user_id=user_id
+        )
+        
+        return {
+            "message": f"Successfully imported LinkedIn data for user {updated_user.name}",
+            "user_id": user_id,
+            "linkedin_url": updated_user.linkedin_url,
+            "updated_fields": {
+                "bio": profile_data.get('headline'),
+                "linkedin_id": profile_data.get('linkedin_id'),
+                "profile_picture": profile_data.get('profile_picture_url')
+            }
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error importing LinkedIn data: {str(e)}")
+        raise HTTPException(status_code=500, detail="LinkedIn data import failed")
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# DATA IMPORT ENDPOINTS
+# ════════════════════════════════════════════════════════════════════════════════
+
+@router.post("/import/attendees-csv")
+async def import_attendees_from_csv(
+    event_id: int,
+    file: UploadFile = File(...),
+    auto_register: bool = True,
+    db: Session = Depends(get_db)
+):
+    """
+    Import attendees from CSV file and optionally register them for an event
+    
+    CSV Format:
+    name,email,job_title,company,industry,bio,experience_years,interests,goals
+    
+    Args:
+        event_id: ID of event to register attendees for
+        file: CSV file containing attendee data
+        auto_register: Whether to automatically register users for the event
+        db: Database session
+    """
+    try:
+        # Verify event exists
+        event = db.query(Event).filter(Event.id == event_id).first()
+        if not event:
+            raise HTTPException(status_code=404, detail="Event not found")
+        
+        # Read CSV file
+        contents = await file.read()
+        csv_data = contents.decode('utf-8')
+        
+        # Parse CSV using pandas for robust handling
+        try:
+            df = pd.read_csv(io.StringIO(csv_data))
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Invalid CSV format: {str(e)}")
+        
+        # Validate required columns
+        required_columns = ['name', 'email']
+        missing_columns = [col for col in required_columns if col not in df.columns]
+        if missing_columns:
+            raise HTTPException(
+                status_code=400, 
+                detail=f"Missing required columns: {', '.join(missing_columns)}"
+            )
+        
+        # Import statistics
+        stats = {
+            "total_rows": len(df),
+            "users_created": 0,
+            "users_updated": 0,
+            "users_registered": 0,
+            "errors": []
+        }
+        
+        created_user_ids = []
+        
+        # Process each row
+        for index, row in df.iterrows():
+            try:
+                # Extract user data with defaults for missing fields
+                user_data = {
+                    "name": str(row.get('name', '')).strip(),
+                    "email": str(row.get('email', '')).strip().lower(),
+                    "job_title": str(row.get('job_title', '')).strip(),
+                    "company": str(row.get('company', '')).strip(),
+                    "industry": str(row.get('industry', '')).strip(),
+                    "bio": str(row.get('bio', '')).strip(),
+                    "experience_years": None,
+                    "linkedin_url": str(row.get('linkedin_url', '')).strip(),
+                }
+                
+                # Handle experience years
+                if 'experience_years' in row and pd.notna(row['experience_years']):
+                    try:
+                        user_data["experience_years"] = int(float(row['experience_years']))
+                    except (ValueError, TypeError):
+                        pass
+                
+                # Validate required fields
+                if not user_data["name"] or not user_data["email"]:
+                    stats["errors"].append(f"Row {index + 1}: Missing name or email")
+                    continue
+                
+                # Check if user already exists
+                existing_user = db.query(User).filter(User.email == user_data["email"]).first()
+                
+                if existing_user:
+                    # Update existing user with new information
+                    for key, value in user_data.items():
+                        if value and value != '' and key != 'email':  # Don't update email
+                            setattr(existing_user, key, value)
+                    
+                    user_id = existing_user.id
+                    stats["users_updated"] += 1
+                    logger.info(f"Updated existing user: {user_data['email']}")
+                else:
+                    # Create new user
+                    new_user = User(**user_data)
+                    db.add(new_user)
+                    db.flush()  # Get the ID
+                    
+                    user_id = new_user.id
+                    stats["users_created"] += 1
+                    logger.info(f"Created new user: {user_data['email']}")
+                
+                created_user_ids.append(user_id)
+                
+                # Handle interests if provided
+                if 'interests' in row and pd.notna(row['interests']):
+                    interests_str = str(row['interests']).strip()
+                    if interests_str:
+                        # Split by comma, semicolon, or pipe
+                        interests = [i.strip() for i in interests_str.replace(';', ',').replace('|', ',').split(',')]
+                        
+                        # Remove existing interests for this user
+                        db.query(UserInterest).filter(UserInterest.user_id == user_id).delete()
+                        
+                        # Add new interests
+                        for interest in interests[:10]:  # Limit to 10 interests
+                            if interest:
+                                db_interest = UserInterest(user_id=user_id, interest=interest)
+                                db.add(db_interest)
+                
+                # Handle goals if provided
+                if 'goals' in row and pd.notna(row['goals']):
+                    goals_str = str(row['goals']).strip()
+                    if goals_str:
+                        # Split by comma, semicolon, or pipe
+                        goals = [g.strip() for g in goals_str.replace(';', ',').replace('|', ',').split(',')]
+                        
+                        # Remove existing goals for this user
+                        db.query(UserGoal).filter(UserGoal.user_id == user_id).delete()
+                        
+                        # Add new goals
+                        for goal in goals[:10]:  # Limit to 10 goals
+                            if goal:
+                                db_goal = UserGoal(user_id=user_id, goal=goal)
+                                db.add(db_goal)
+                
+            except Exception as e:
+                error_msg = f"Row {index + 1}: {str(e)}"
+                stats["errors"].append(error_msg)
+                logger.error(f"Error processing row {index + 1}: {e}")
+                continue
+        
+        # Commit user creation/updates
+        db.commit()
+        
+        # Auto-register users for event if requested
+        if auto_register and created_user_ids:
+            for user_id in created_user_ids:
+                try:
+                    # Check if already registered
+                    existing_registration = db.query(EventAttendee).filter(
+                        EventAttendee.event_id == event_id,
+                        EventAttendee.user_id == user_id
+                    ).first()
+                    
+                    if not existing_registration:
+                        registration = EventAttendee(event_id=event_id, user_id=user_id)
+                        db.add(registration)
+                        stats["users_registered"] += 1
+                except Exception as e:
+                    stats["errors"].append(f"Registration error for user {user_id}: {str(e)}")
+            
+            db.commit()
+        
+        return {
+            "message": "CSV import completed successfully",
+            "event_id": event_id,
+            "event_name": event.name,
+            "statistics": stats,
+            "sample_format": {
+                "description": "Expected CSV format",
+                "required_columns": ["name", "email"],
+                "optional_columns": ["job_title", "company", "industry", "bio", "experience_years", "interests", "goals", "linkedin_url"],
+                "example_row": "Alice Chen,alice@company.com,AI Engineer,TechCorp,Technology,AI specialist,4,Machine Learning|Python,Find cofounders|Learn startups,https://linkedin.com/in/alice"
+            }
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error importing CSV: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"CSV import failed: {str(e)}")
+
+
+@router.get("/import/csv-template")
+async def download_csv_template():
+    """
+    Download a sample CSV template for attendee import
+    """
+    try:
+        # Create sample CSV data
+        sample_data = [
+            {
+                "name": "Alice Chen",
+                "email": "alice@company.com", 
+                "job_title": "AI Engineer",
+                "company": "TechCorp",
+                "industry": "Technology",
+                "bio": "AI specialist with focus on machine learning",
+                "experience_years": 4,
+                "interests": "Machine Learning,Python,AI Ethics",
+                "goals": "Find cofounders,Learn about startups",
+                "linkedin_url": "https://linkedin.com/in/alice"
+            },
+            {
+                "name": "Bob Martinez",
+                "email": "bob@vc.com",
+                "job_title": "Partner",
+                "company": "Venture Capital",
+                "industry": "Finance", 
+                "bio": "Venture capital investor focused on AI startups",
+                "experience_years": 8,
+                "interests": "Investment,Startups,AI",
+                "goals": "Find deals,Meet entrepreneurs",
+                "linkedin_url": "https://linkedin.com/in/bob"
+            }
+        ]
+        
+        # Create CSV content
+        output = io.StringIO()
+        if sample_data:
+            writer = csv.DictWriter(output, fieldnames=sample_data[0].keys())
+            writer.writeheader()
+            writer.writerows(sample_data)
+        
+        csv_content = output.getvalue()
+        
+        from fastapi.responses import Response
+        return Response(
+            content=csv_content,
+            media_type="text/csv",
+            headers={"Content-Disposition": "attachment; filename=attendee_import_template.csv"}
+        )
+        
+    except Exception as e:
+        logger.error(f"Error creating CSV template: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to generate CSV template")
+
+
+@router.post("/import/validate-csv")
+async def validate_csv_format(file: UploadFile = File(...)):
+    """
+    Validate CSV format without importing data
+    """
+    try:
+        # Read and parse CSV
+        contents = await file.read()
+        csv_data = contents.decode('utf-8')
+        
+        try:
+            df = pd.read_csv(io.StringIO(csv_data))
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Invalid CSV format: {str(e)}")
+        
+        # Validation results
+        validation = {
+            "valid": True,
+            "total_rows": len(df),
+            "columns_found": list(df.columns),
+            "required_columns": ["name", "email"],
+            "optional_columns": ["job_title", "company", "industry", "bio", "experience_years", "interests", "goals", "linkedin_url"],
+            "missing_required": [],
+            "validation_errors": [],
+            "sample_data": []
+        }
+        
+        # Check required columns
+        for col in validation["required_columns"]:
+            if col not in df.columns:
+                validation["missing_required"].append(col)
+                validation["valid"] = False
+        
+        # Validate data quality
+        empty_names = df[df['name'].isna() | (df['name'] == '')].index.tolist()
+        empty_emails = df[df['email'].isna() | (df['email'] == '')].index.tolist()
+        
+        if empty_names:
+            validation["validation_errors"].append(f"Empty names in rows: {empty_names}")
+        if empty_emails:
+            validation["validation_errors"].append(f"Empty emails in rows: {empty_emails}")
+        
+        # Add sample data (first 3 rows)
+        for i, row in df.head(3).iterrows():
+            sample_row = {col: str(row[col]) if pd.notna(row[col]) else "" for col in df.columns}
+            validation["sample_data"].append(sample_row)
+        
+        if validation["validation_errors"]:
+            validation["valid"] = False
+        
+        return validation
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error validating CSV: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"CSV validation failed: {str(e)}")
 
 
 # ════════════════════════════════════════════════════════════════════════════════

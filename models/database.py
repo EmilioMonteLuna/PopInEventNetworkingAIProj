@@ -34,6 +34,7 @@ class User(Base):
     bio = Column(Text)
     experience_years = Column(Integer)
     linkedin_url = Column(String(500))
+    linkedin_id = Column(String(100), unique=True, index=True)  # LinkedIn user ID
     
     # Profile metadata
     profile_completeness = Column(Float, default=0.0)

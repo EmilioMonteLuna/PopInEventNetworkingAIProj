@@ -14,7 +14,7 @@ import os
 
 # Configuration
 API_BASE_URL = "http://localhost:8000/api/v1"
-OUTPUT_DIR = "visualizations"
+OUTPUT_DIR = "../visualizations"
 
 def ensure_server_running():
     """Check if the API server is running"""

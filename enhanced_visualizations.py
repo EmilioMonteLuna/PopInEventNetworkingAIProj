@@ -15,7 +15,7 @@ import numpy as np
 
 # Configuration
 API_BASE_URL = "http://localhost:8000/api/v1"
-OUTPUT_DIR = "../enhanced_visualizations"
+OUTPUT_DIR = "enhanced_visualizations"
 
 # Set styles
 sns.set_style("whitegrid")

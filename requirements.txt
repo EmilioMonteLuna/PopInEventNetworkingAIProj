@@ -13,3 +13,6 @@ pytest~=8.4.1
 pydantic-settings~=2.10.1
 jupyter
 email-validator
+seaborn~=0.13.0
+matplotlib~=3.8.0
+python-multipart~=0.0.19

@@ -48,6 +48,11 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     log_format: str = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
     
+    # LinkedIn API Configuration
+    linkedin_client_id: Optional[str] = None
+    linkedin_client_secret: Optional[str] = None
+    linkedin_redirect_uri: str = "http://localhost:8000/api/v1/linkedin/callback"
+    
     # External Services (for future use)
     redis_url: Optional[str] = None
     tableau_server_url: Optional[str] = None
